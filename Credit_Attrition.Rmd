@@ -1,0 +1,317 @@
+---
+title: "Credit Attrition Prediction"
+author: "Matt Dunham"
+date: "2022-12-13"
+output: html_document
+---
+
+In this document, I investigate a [https://www.kaggle.com/datasets/whenamancodes/credit-card-customers-prediction?resource=download](Kaggle dataset) containing various customer information and their credit - from credit holder demographics (e.g. age, marital status), to credit utilization and other potentially important financial issues.
+
+## The Problem at Hand
+
+A manager at the bank is disturbed with more and more customers leaving their credit card services. They would really appreciate if one could predict for them who is gonna get churned so they can proactively go to the customer to provide them better services and turn customers' decisions in the opposite direction.
+
+Let us begin to investigate our data!
+
+```{r setup, include=FALSE}
+#necessary packages
+library(readr) #reading in csv file
+library(tidyr) #data cleaning
+library(ggplot2) #data vis
+library(dplyr) #data cleaning
+library(kableExtra) #tables
+library(MASS) #variable selection
+library(ROCR) #ROC curves
+library(Metrics) #prediction for ROC curves
+library(MASS)
+library(Hmisc) #creating hist grids
+library(moments) #finding skew of variables
+
+set.seed(3999) #set seed
+
+```
+
+## Data Investigation
+
+First, let's take a look at the first few response in our data in order to ensure we clean our data properlly and get it in the right format for our prediction.
+
+```{r data}
+credit <- read_csv("BankChurners.csv") #reading in data
+
+head(credit) #taking a look at first few values in data
+```
+
+We notice a few variables are numeric, and a few are categorical. Given the problem at hand is to predict attrition, we're going to need to convert categorical variables to numeric. We can take a look at the various levels within each categorical variable and then convert said levels to numeric values.
+
+Additionally, we'll quickly take a look at missing values to see if we need to remove any data before starting our data cleaning process.
+
+```{r}
+#from the head, I see there a few categorical variables. These need to be recorded numerically for our model. 
+#let's take a look at the levels within each categorical variable for recoding purposes
+unique(credit$Attrition_Flag)
+unique(credit$Education_Level)
+unique(credit$Marital_Status)
+unique(credit$Income_Category)
+unique(credit$Card_Category)
+
+kable(colSums(is.na(credit)), col.names = "NA Count") #are there any NAs? No.
+
+```
+
+## Data Cleaning
+
+Now that we've identified categorical variables, their respective levels and determined there aren't missing values present, we can recode our categorical variables. Ideally, these levels will be continuous and have a proper order, although, it appears martial status may be lacking this assumption.
+
+```{r cleaning}
+
+#time for data cleaning. Our main goal is to recode the categorical variables, but we'll also remove a few unnecessary variables.
+#we can do this in one pipe.
+credit_cleaned_inc <- credit %>% #pipe into new, cleaned data frame
+  
+  mutate(Attrition_Flag = ifelse(Attrition_Flag == "Existing Customer", 1, 0)) %>% #recode attrition
+  
+  mutate(Gender = ifelse(Gender == "M", 1, 0)) %>%
+  
+  mutate(Education_Level = case_when(Education_Level == "Unknown" ~ 1, #recode educaiton level
+                                     Education_Level == "Uneducated" ~ 2,
+                                     Education_Level == "High School" ~ 3,
+                                     Education_Level == "College" ~ 4,
+                                     Education_Level == "Graduate" ~ 5,
+                                     Education_Level == "Post-Graduate" ~ 6,
+                                     Education_Level == "Doctorate" ~ 7)) %>%
+  
+  mutate(Marital_Status = case_when(Marital_Status == "Unknown" ~ 1, #recode marital status...not as obvious of an order here...
+                                    Marital_Status == "Single" ~ 2,
+                                    Marital_Status == "Married" ~ 3,
+                                    Marital_Status == "Divorced" ~ 4)) %>%
+  
+  mutate(Income_Category = case_when(Income_Category == "Unknown" ~ 1, #recode income
+                                     Income_Category == "Less than $40K" ~ 2,
+                                     Income_Category == "$40K - $60K" ~ 3,
+                                     Income_Category == "$60K - $80K" ~ 4,
+                                     Income_Category == "$80K - $120K" ~ 5,
+                                     Income_Category == "$120K +" ~ 6)) %>%
+  
+  mutate(Card_Category = case_when(Card_Category == "Blue" ~ 1, #recode card type
+                                    Card_Category == "Gold" ~ 2,
+                                    Card_Category == "Silver" ~ 3,
+                                    Card_Category == "Platinum" ~ 4)) %>%
+  
+  #these columns are arbitrary, so we'll remove them
+  dplyr::select(-Naive_Bayes_Classifier_Attrition_Flag_Card_Category_Contacts_Count_12_mon_Dependent_count_Education_Level_Months_Inactive_12_mon_1,
+                -Naive_Bayes_Classifier_Attrition_Flag_Card_Category_Contacts_Count_12_mon_Dependent_count_Education_Level_Months_Inactive_12_mon_2)
+
+```
+
+Additionally, we remove two columns that won't serve us any purpose in this analysis.
+
+## Determining Normality
+
+Now that our data is clean, we can look into the normality of our numeric variables. This normality assumption is important for our future logistic regression and prediction, so we can determine which variables are normal and which are not.
+
+```{r}
+#We need to investigate the skewness of our variables to run out logistic regression. We can generate a histogram to visualy check, and further calculate skewness.
+hist.data.frame(credit_cleaned_inc) #hist of variables
+abs(skewness(credit_cleaned_inc)) > 1 #checking if skewness is too much. If true, it's too large
+```
+
+We can see that a few variables are lacking normality and have too high or low skew. Given we aren't aiming to interpret any aspect of our predictors, we'll procede with a log-transformation on these variables in hopes we can deal with the skewness.
+
+```{r}
+#we can then transform variables to help with the skewness. Log transforming variables won't impact our inference given we're predicting.
+abs(skewness(log(credit_cleaned_inc$Card_Category))) #can't remove skewness...we'll drop this later
+abs(skewness(log(credit_cleaned_inc$Credit_Limit)))
+abs(skewness(log(credit_cleaned_inc$Avg_Open_To_Buy)))
+abs(skewness(log(credit_cleaned_inc$Total_Amt_Chng_Q4_Q1  + .1)))
+abs(skewness(log(credit_cleaned_inc$Total_Trans_Amt)))
+abs(skewness(log(credit_cleaned_inc$Total_Ct_Chng_Q4_Q1 + .1)))
+#skewness looks good now! let's reassign variables
+```
+
+After log-transforming our skewed variables, we seem to get rid of a lot of the skewness issues. It appeared Card_Category remains highly skewed due to the sheer proportion of individuals having a blue card, so we'll drop this variable in our final, cleaned dataset.
+
+```{r}
+#reassigning log-transformed variables to new dataset
+credit_cleaned <- credit_cleaned_inc %>%
+  mutate(Credit_Limit = log(Credit_Limit)) %>%
+  mutate(Avg_Open_To_Buy = log(Avg_Open_To_Buy)) %>%
+  mutate(Total_Amt_Chng_Q4_Q1 = log(Total_Amt_Chng_Q4_Q1  + .1)) %>%
+  mutate(Total_Trans_Amt = log(Total_Trans_Amt)) %>%
+  mutate(Total_Ct_Chng_Q4_Q1 = log(Total_Ct_Chng_Q4_Q1 + .1)) %>%
+  dplyr::select(-Card_Category) #removing pesky skewed variable
+
+#looking good now!
+hist.data.frame(credit_cleaned)
+abs(skewness(credit_cleaned)) > 1
+
+```
+
+Skewness now looks good, and we can proceed to the prediction stage!
+
+## Investigating Correlations
+
+First, let's take a look at how our predictors correlate with the Attrition_Flag variable. 
+
+```{r}
+#let's take a look at how the remaining variables correlate with our dependent variable, Attrition_Flag
+sort(cor(credit_cleaned$Attrition_Flag, credit_cleaned[,-(1:2)])[1,], decreasing=FALSE) %>% #correlation matrix
+  kable(col.names = "Correlations w/ Attrition_Flag")  #creating table with variables in order
+
+```
+
+As we can see, a few variables correlate fairly with Attrition_Flag, and a few seem to not correlate much at all. It appears we definitely have some useful predictors, but we need to find our which are really best for building a logistic regression model for prediction.
+
+## Splitting Data into Train and Test
+
+Given we aim to predict Attrition_Flag, we need to split our data into a train and test portion in order to train our prediction model, then test it on our test data. We'll go ahead and assign 70% of our data to the train data, then test our model on the remaining 30%.
+
+```{r logistic}
+#useful resource I referenced for logistic regression in R
+#http://www.sthda.com/english/articles/36-classification-methods-essentials/151-logistic-regression-essentials-in-r/
+
+#we need to split our data into a train and test data
+credit_train <- credit_cleaned %>% dplyr::sample_frac(0.7) #split 70% of our data into a training data to train predictions
+credit_test <- dplyr::anti_join(credit_cleaned, credit_train, by="CLIENTNUM") #join the remainder of the dataset into a test data to see how predicitons fair
+
+#removing the identification column needed for joining from each dataset
+credit_train <- credit_train %>% dplyr::select(-CLIENTNUM) 
+credit_test <- credit_test %>% dplyr::select(-CLIENTNUM)
+```
+
+## Logistic Regression with All Variables
+
+To start, we'll simply fit a logistic regression model with all potential predictors in our dataset. Although this most likely won't be our best model, we'll be able to use this fitted model to investigate how our variables interact with each other, and further build a reduced model that may look more like a final model we can use for prediction. 
+
+```{r}
+#fitting a logistic regression with ALL variables
+fit_full <- glm(Attrition_Flag ~., data=credit_train, family=binomial(link = "logit"))
+
+```
+
+## Variable Selection and Reduced Model
+
+Using our full model, we can perform an ANOVA to check our variables interact with each other. This will allow us to reduce our model if any variables seem to not be too helpful in the prediction of Attrition_Flag.
+
+```{r}
+#it's very plausible that not all variables are needed, so we can run an ANOVA to investigate the usefulness of each variable
+anova(fit_full, test = "Chisq")
+
+#the ANOVA shows there are multiple unnecessary varaiables in our full model, so we'll run another model removing them.
+```
+
+The ANOVA shows multiple unnecessary variables in our model. In the future, we may not have all this information available or it may be cheaper to not collect some information, so we want to build the best model possible using as little information as we can.
+
+We decide to remove Customer_Age, Dependent_count, Education_Level, Marital_Status, Income_Category and Months_on_book given their lack of significance in the full model. We can now fit a reduced model with all remaining variables.
+
+```{r}
+#remove  Customer_Age, Dependent_count, Education_Level, Marital_Status, Income_Category, Months_on_book
+
+#now we fit the reduced model
+fit_red <- glm(Attrition_Flag ~ Gender + Total_Relationship_Count + Months_Inactive_12_mon + Contacts_Count_12_mon
+               + Credit_Limit + Total_Revolving_Bal + Total_Amt_Chng_Q4_Q1 + Total_Trans_Amt + Total_Trans_Ct
+               + Total_Ct_Chng_Q4_Q1 + Avg_Open_To_Buy + Avg_Utilization_Ratio, data=credit_train, family=binomial(link = "logit"))
+
+#we can compare each model in an ANOVA and see if our reduced model is truly better than our full model
+```
+
+Finally, we can perform another ANOVA to check if our reduced model is performing better than our full model. 
+
+```{r}
+anova(fit_full, fit_red, test="Chisq")
+
+#very small p-value - we'll run with this reduced model
+```
+
+This ANOVA provides a very small p-value, and shows this reduced model is significantly better than our full model and can clearly see all variables in the reduced model show significance in relation to Attrition_Flag.
+
+## Starting our Predictions
+
+Now that we have a final model, we can start the prediction process! Using our reduced model, we can predict Attrition_Flag in our test data. First, we can generate probabilities of Attrition_Flag given our model.
+
+```{r}
+#now we use our reduced model to generate probabilities of Attrition
+probs <- fit_red %>% predict(credit_test, type="response")
+```
+
+The tricky part about this prediction is figuring out at what probability do we consider large enough to say this is prediction an Attrited customer, or an Existing customer. Of course, it's difficult to obtain a probability of 1 that a customer is Existing or Attrited, but there may be a probability that seems to correspond well with the real Attrition found in our test data.
+
+For investigatory purposes, we'll say if a probability is >= 0.5 that it accurately predicts a customer is Existing, but we can investigate this cut-off a bit further. We can then use these prediction with a cut-off of 0.5 to compare them to the true Attrition_Flag variable to determine how accurate these prediction are.
+
+```{r}
+#there's not really a logical cut-off for what a "good" probability is (yet), so we'll use 0.5 just to see what happes
+pred_classes <- ifelse(probs >= .5, 1, 0) #if the prob is >= 0.5, we say it predicts Attrition_Flag at 1
+
+#we can then figure our how well these predictions align with our test dataset
+mean(pred_classes == credit_test$Attrition_Flag)
+
+#this is a high number, but we're not sure how many false-positives exist here. we'll procede with a ROC analysis
+
+```
+
+It appears that a large proportion of our Attrition_Flag variable was accurately predicted! However, simply counting the proportion of 1s and 0s in our test and predicted data is not our best option. By doing this, we may be over counting false-positives, which doesn't really help in the true application of our model for prediction (we want as accurate predictions for individuals as possible!). This can be investigated further with ROC and finding the AUV of the ROC.
+
+## ROC and AUC of ROC.
+
+First, let's generate a ROC and AUC of ROC using our arbitrary cut-off of 0.5. We want the ROC to have a steep start, and then level off as it approaches 1. The AUC (or Area Under the Curve) of the ROC will give us a measure of our true positive rate in our predictions, which really helps show us how accurate our model truly is.
+
+```{r}
+#Using a ROC curve can allow for a deeper look at how well our predictions are doing. We'll go ahead and analyze the ROC curve at a cut-off of .5
+
+pr <- prediction(pred_classes, credit_test$Attrition_Flag) #again, predicting with prob cut-off of .5
+perf <- performance(pr, measure = "tpr", x.measure = "fpr")  #determining how well these predictions perform
+
+plot(perf) #plotting our performation in a ROC curve
+
+auc(credit_test$Attrition_Flag, pred_classes) #how well does it do? a larger value shows better performance.
+```
+
+This ROC and corresponding AUC of the ROC seem good, but we should test other potential probability cut-offs to see if there are better cut-offs to use in our prediction assignment. 
+
+## Investigating Many Possible Cut-offs
+
+We'll parse through all possible probabilities from 0 to 1, separating each probability by 0.01, and then investigate the AUC of the ROC for each probability cut-off and determine which probability gives us the largest AUC.
+
+```{r}
+#now, we can generate area under the curve (AUC) values for various possible cut-off since we really don't know which is best.
+possible_probs <- seq(0, 1, .01) #create possible cut-offs from 0-1 seqenced by .01
+AUCs <- rep(NA, length(possible_probs)) #creating empty vector for future AUC values
+
+#we can look through our possible cut-offs
+for( i in 1:length(possible_probs)) {
+  
+  pred_classes <- ifelse(probs >= possible_probs[i], 1, 0) #use ith cut-off prob
+  AUCs[i] <- auc(credit_test$Attrition_Flag, pred_classes) #store the AUC
+  
+  if( i == length(possible_probs)) { #when the loop is finished
+    
+    print(max(AUCs)) #print the best AUC
+    print(possible_probs[which.max(AUCs)]) #and the corresponding cut-off
+      
+  }
+  
+}
+```
+
+Through investigating these possible cut-off probabilities, we find a corresponding probability associated with the maximum AUC of the ROC. This probability seems to give us the largest AUC (and thus the most accurate prediction model), and should be the best cut-off we can use at the moment. We can plot the possible cut-offs with the AUCs we obtian to see how AUC changed with cut-offs.
+
+```{r}
+
+plot(possible_probs, AUCs) #let's see the AUCs for each possible cut-off
+```
+
+Interesting graph, but now that we have a final, best cut-off, let's build our final prediction with this new cut-offs.
+
+```{r}
+pred_classes <- ifelse(probs >= possible_probs[which.max(AUCs)], 1, 0) #now we predict with our best cut-off
+
+mean(pred_classes == credit_test$Attrition_Flag) #lower matching, but better AUC
+
+pr <- prediction(pred_classes, credit_test$Attrition_Flag) #predict again for new ROC
+perf <- performance(pr, measure = "tpr", x.measure = "fpr") #determine how new predictions perform
+
+plot(perf) #plot our ROC
+```
+
+
+
+
